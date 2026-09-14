@@ -1,0 +1,4 @@
+# Scanner heuristics and the requirement registry change what every downstream repo enforces.
+skills/soc2-dev/scripts/            @aggtushar123
+skills/soc2-dev/references/requirements.md  @aggtushar123
+skills/soc2-dev/SKILL.md            @aggtushar123

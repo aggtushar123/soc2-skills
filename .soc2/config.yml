@@ -1,0 +1,11 @@
+# SOC 2 config for the soc2-skills repository itself. This repo ships documentation
+# and three standard-library scripts; it is not an application, so most requirements
+# are n/a. The scanner runs in CI (dogfooding) with test fixtures excluded because
+# they intentionally contain planted violations.
+company: "soc2-skills"
+system_name: "soc2-dev skill"
+tsc:
+  security: true
+scan_ignore:
+  - tests
+  - "**/tests/**"

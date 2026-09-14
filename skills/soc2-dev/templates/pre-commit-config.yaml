@@ -15,7 +15,11 @@ repos:
     hooks:
       - id: soc2-scan
         name: soc2 scan (staged)
-        entry: python3 .claude/skills/soc2-dev/scripts/soc2_scan.py . --staged --fail-on high
+        # Works for a per-repo install (.claude/skills) or a global one (~/.claude/skills).
+        entry: >-
+          sh -c 'S=.claude/skills/soc2-dev/scripts/soc2_scan.py;
+          [ -f "$S" ] || S="$HOME/.claude/skills/soc2-dev/scripts/soc2_scan.py";
+          python3 "$S" . --staged --fail-on high'
         language: system
         pass_filenames: false
         always_run: true

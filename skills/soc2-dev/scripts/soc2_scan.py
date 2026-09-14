@@ -12,7 +12,7 @@ Usage:
     python3 soc2_scan.py . --staged --fail-on high    # pre-commit gate
 
 Exit code 1 when any finding meets or exceeds --fail-on (default: critical).
-No third-party dependencies.
+No third-party dependencies. Requires Python 3.9+.
 
 Suppress a single line with a trailing `soc2:ignore` comment (see SUPPRESS below).
 """
@@ -70,19 +70,30 @@ def suppressed_lines(text: str) -> set[int]:
 DEBUG_ALLOWED_NAMES = {
     ".env.local", ".env.development", ".env.dev", ".env.test", ".env.example",
     "settings_local.py", "settings_dev.py", "conftest.py", "docker-compose.override.yml",
+    "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml",
+    "docker-compose.dev.yml", "docker-compose.local.yml",
 }
 
 
 def git_staged_files(root: str) -> list[str]:
     """Paths staged for commit (added/copied/modified), absolute. Empty if not a repo."""
     try:
+        # git prints paths relative to the repository top level, not to `root`, so
+        # resolve against the top level; otherwise a subdirectory root silently scans nothing.
+        top = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
         out = subprocess.run(
             ["git", "-C", root, "diff", "--cached", "--name-only", "--diff-filter=ACM"],
             capture_output=True, text=True, check=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return []
-    return [os.path.join(root, p) for p in out.splitlines() if p.strip()]
+    root_abs = os.path.realpath(root)
+    paths = [os.path.realpath(os.path.join(top, p)) for p in out.splitlines() if p.strip()]
+    # Keep only staged files under `root` so scanning a subdirectory stays scoped to it.
+    return [p for p in paths if os.path.commonpath([root_abs, p]) == root_abs]
 
 
 # --------------------------------------------------------------------------- config
@@ -104,45 +115,53 @@ def load_config(path: str) -> dict:
 
 
 def _mini_yaml(text: str) -> dict:
+    """Parse the subset of YAML the config template uses: nested maps, scalars,
+    inline lists, and block lists (at the key's indent or deeper)."""
     root: dict = {}
-    stack: list[tuple[int, dict | list]] = [(-1, root)]
-    last_key_at: dict[int, str] = {}
+    # stack entries: (indent, container, (parent_container, key) or None)
+    stack: list = [(-1, root, None)]
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].rstrip() if not raw.strip().startswith('"') else raw.rstrip()
         if not line.strip():
             continue
         indent = len(line) - len(line.lstrip())
         content = line.strip()
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        parent = stack[-1][1]
-        if content.startswith("- "):
+        is_item = content.startswith("- ")
+        while len(stack) > 1:
+            top_indent, top_cont, top_link = stack[-1]
+            # A block list may sit at the same indent as its key; keep the
+            # empty placeholder on the stack so the items attach to it.
+            keep = is_item and top_indent == indent and top_link and (
+                isinstance(top_cont, list) or (isinstance(top_cont, dict) and not top_cont)
+            )
+            if top_indent > indent or (top_indent == indent and not keep):
+                stack.pop()
+            else:
+                break
+        top_indent, cont, link = stack[-1]
+        if is_item:
             val = _scalar(content[2:])
-            if isinstance(parent, dict):
-                key = last_key_at.get(stack[-1][0])
-                if key is not None:
-                    if not isinstance(parent.get(key), list):
-                        parent[key] = []
-                    parent[key].append(val)
-            elif isinstance(parent, list):
-                parent.append(val)
+            if isinstance(cont, dict):
+                if cont or link is None:
+                    continue  # list item with no owning key; ignore
+                parent, key = link
+                cont = []
+                parent[key] = cont
+                stack[-1] = (top_indent, cont, link)
+            cont.append(val)
             continue
-        if ":" in content:
+        if ":" in content and isinstance(cont, dict):
             key, _, rest = content.partition(":")
             key = key.strip().strip('"').strip("'")
             rest = rest.strip()
-            if not isinstance(parent, dict):
-                continue
             if rest == "":
                 child: dict = {}
-                parent[key] = child
-                last_key_at[indent] = key
-                stack.append((indent, child))
+                cont[key] = child
+                stack.append((indent, child, (cont, key)))
             elif rest.startswith("[") and rest.endswith("]"):
-                parent[key] = [_scalar(x) for x in rest[1:-1].split(",") if x.strip()]
+                cont[key] = [_scalar(x) for x in rest[1:-1].split(",") if x.strip()]
             else:
-                parent[key] = _scalar(rest)
-                last_key_at[indent] = key
+                cont[key] = _scalar(rest)
     return root
 
 
@@ -181,7 +200,7 @@ class Finding:
 
 class Scanner:
     def __init__(self, root: str, config: dict, staged: list[str] | None = None):
-        self.root = os.path.abspath(root)
+        self.root = os.path.realpath(root)
         self.cfg = config
         self.staged = staged
         self.findings: list[Finding] = []
@@ -386,7 +405,9 @@ class Scanner:
         ("Slack token", re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}\b"), "critical"),
         ("Stripe live key", re.compile(r"\b(sk|rk)_live_[0-9a-zA-Z]{16,}\b"), "critical"),
         ("Stripe test key", re.compile(r"\b(sk|rk)_test_[0-9a-zA-Z]{16,}\b"), "medium"),
-        ("AWS secret access key", re.compile(r"(?i)aws.{0,20}?['\"][0-9a-zA-Z/+]{40}['\"]"), "critical"),
+        # Anchored on the key name and requiring upper, lower, and digit so account IDs,
+        # hashes, and other 40-char strings near the word "aws" are not flagged.
+        ("AWS secret access key", re.compile(r"(?i)(aws_?secret_?access_?key|secret_?access_?key|aws_?secret_?key)\s*[:=]\s*['\"](?=[0-9a-zA-Z/+]{40}['\"])(?=[^'\"]*[a-z])(?=[^'\"]*[A-Z])(?=[^'\"]*[0-9])[0-9a-zA-Z/+]{40}['\"]"), "critical"),
         ("Google API key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"), "high"),
         ("JWT literal", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "high"),
         (
@@ -479,9 +500,10 @@ class Scanner:
         (re.compile(r"(?i)[\"']\s*(SELECT|INSERT|UPDATE|DELETE)\b[^\"']*(WHERE|VALUES|SET)[^\"']*[\"']\s*\+\s*[A-Za-z_]"), "SQL string concatenated with a variable", "API-03", "high"),
         # The three below tolerate quote characters *inside* the SQL literal
         # (`"... WHERE name = '" + name`), which the [^"']* patterns above cannot cross.
-        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?[\"']\s*\+\s*[A-Za-z_]"), "SQL string concatenated with a variable", "API-03", "high"),
-        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?[\"']\s*\.\s*format\s*\("), "SQL built with .format()", "API-03", "high"),
-        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?[\"']\s*%\s*[\(\[]?\s*[A-Za-z_]"), "SQL built with %-interpolation", "API-03", "high"),
+        # A second SQL keyword is required so HTTP method strings ("DELETE " + url) do not match.
+        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?\b(FROM|WHERE|INTO|SET|VALUES|JOIN|TABLE)\b[\s\S]{0,240}?[\"']\s*\+\s*[A-Za-z_]"), "SQL string concatenated with a variable", "API-03", "high"),
+        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?\b(FROM|WHERE|INTO|SET|VALUES|JOIN|TABLE)\b[\s\S]{0,240}?[\"']\s*\.\s*format\s*\("), "SQL built with .format()", "API-03", "high"),
+        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?\b(FROM|WHERE|INTO|SET|VALUES|JOIN|TABLE)\b[\s\S]{0,240}?[\"']\s*%\s*[\(\[]?\s*[A-Za-z_]"), "SQL built with %-interpolation", "API-03", "high"),
         (re.compile(r"(?i)\b(os\.system|os\.popen|subprocess\.(call|run|Popen|check_output)\([^)]*shell\s*=\s*True|child_process\.exec\(|execSync\(|Runtime\.getRuntime\(\)\.exec\(|exec\.Command\(\s*\"(sh|bash|cmd)\")"), "Shell command execution; verify inputs are not user-controlled", "API-03", "medium"),
         (re.compile(r"(?<![A-Za-z_.])eval\s*\(|new Function\(|vm\.runIn"), "Dynamic code evaluation", "API-03", "high"),
         (re.compile(r"(?i)\$where\s*:|\{\s*\$where"), "MongoDB $where operator (JS injection)", "API-03", "high"),
@@ -516,7 +538,8 @@ class Scanner:
         r"|card[_-]?number|cvv|req\.body|request\.body|req\.headers|request\.headers|\.cookies"
         r"|private[_-]?key|otp)\b"
         # Identifier-suffixed forms: generate_token(), user_secret, refresh_password.
-        r"|[A-Za-z]+_(?:tokens?|secrets?|passwords?|credentials?)\b"
+        # Pagination, CSRF, push, and cancellation tokens are not secrets.
+        r"|(?<![A-Za-z])(?!(?:next|page|pagination|continuation|cursor|csrf|xsrf|anti_?forgery|cancellation|cancel|expo|push|device|fcm|apns|verification|confirmation|invite|design|color|colour)_)[A-Za-z]+_(?:tokens?|secrets?|passwords?|credentials?)\b"
     )
     # A string literal with no interpolation is static text, not logged data.
     STATIC_STR = re.compile(r"""(['"`])(?:\\.|(?!\1)[^\\])*\1""")
@@ -575,6 +598,8 @@ class Scanner:
             return
         if os.path.basename(rp) in DEBUG_ALLOWED_NAMES:
             return
+        if os.path.basename(rp) == "package.json":
+            return  # npm scripts (`--inspect`, NODE_ENV=development) are developer commands, not deployed config
         for i, line in enumerate(text.splitlines(), 1):
             if self.DEBUG_ON.search(line) and not re.search(r"(?i)os\.environ|getenv|process\.env|if\s+.*\b(dev|development|debug)\b", line):
                 self.add(

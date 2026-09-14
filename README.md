@@ -86,8 +86,34 @@ and scan ignores. Config overrides the registry defaults.
 # Or run the scripts directly:
 python3 .claude/skills/soc2-dev/scripts/soc2_scan.py . --format md
 python3 .claude/skills/soc2-dev/scripts/soc2_scan.py . --format json --fail-on high   # CI gate
+python3 .claude/skills/soc2-dev/scripts/soc2_scan.py . --staged --fail-on high        # pre-commit gate
 python3 .claude/skills/soc2-dev/scripts/control_map.py . --strict
 ```
+
+A wrong or accepted finding can be silenced on that line with a `soc2:ignore` comment
+(or `soc2:ignore-next-line`). A suppression is a review decision, not an exception; a
+**must** requirement that cannot be met goes in `.soc2/EXCEPTIONS.md`.
+
+The scripts need Python 3.9 or newer and nothing else. PyYAML is used for the config
+if installed; otherwise a built-in parser handles the config template's subset.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite has true-positive fixtures (every planted violation must be reported with the
+right ID), false-positive fixtures (ordinary code must produce nothing at medium or
+above), staged-mode and suppression tests, and consistency checks that every requirement
+ID used anywhere exists in the registry. CI runs it on Python 3.9, 3.12, and 3.13, then
+dogfoods the scanner on this repo and runs gitleaks. Scanner changes need a true-positive
+and a false-positive test.
+
+## Status
+
+Public beta (v0.1.0). The Claude-facing half, meaning SKILL.md and the references, is
+stable. The scanner is heuristic and its patterns will keep being tuned; see CHANGELOG.md.
 
 ## What this skill does not do
 
