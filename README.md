@@ -35,7 +35,7 @@ skills/soc2-dev/
 Per repository (recommended, so the skill travels with the code and CI can run the scanner):
 
 ```bash
-git clone https://github.com/<you>/soc2-skills.git /tmp/soc2-skills
+git clone https://github.com/aggtushar123/soc2-skills.git /tmp/soc2-skills
 mkdir -p .claude/skills
 cp -r /tmp/soc2-skills/skills/soc2-dev .claude/skills/soc2-dev
 python3 .claude/skills/soc2-dev/scripts/soc2_init.py . --company "Acme Corp" --owner "@security-team"
