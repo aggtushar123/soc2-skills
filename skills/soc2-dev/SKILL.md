@@ -228,10 +228,43 @@ must fill in.
 | Script | Purpose |
 |--------|---------|
 | `scripts/soc2_init.py` | Scaffold `.soc2/` and repo controls. Detects stack and CI provider. Idempotent; never overwrites existing files without `--force`. |
-| `scripts/soc2_scan.py` | Heuristic scanner. Emits findings with requirement IDs, severity, file, line, and fix hint. `--format md` or `json`. Exit code 1 if any critical finding, useful as a CI gate. |
+| `scripts/soc2_scan.py` | Heuristic scanner. Emits findings with requirement IDs, severity, file, line, and fix hint. `--format md` or `json`. Exit code 1 if any finding meets `--fail-on` (default `critical`), useful as a CI gate. |
 | `scripts/control_map.py` | Greps `SOC2:<ID>` annotations and reconciles them with `CONTROL_MAP.md`. Reports annotated controls missing from the map and map rows whose file no longer exists. |
 
 Run scripts with `python3`. They have no third-party dependencies.
+
+### Scanner modes
+
+```bash
+python3 scripts/soc2_scan.py . --format md            # full audit (audit mode)
+python3 scripts/soc2_scan.py . --staged --fail-on high  # pre-commit gate
+python3 scripts/soc2_scan.py . --min-severity high    # triage the worst first
+```
+
+`--staged` scans only files staged in git and skips the repo-posture checks (CI,
+CODEOWNERS, lockfiles), which describe the repo rather than the change. Stack and
+auth-middleware detection still read the whole repo, so a staged route is not
+reported as unauthenticated just because its middleware lives in an unstaged file.
+
+### Suppressing a line
+
+A finding that is wrong or accepted can be silenced in place:
+
+```python
+API_KEY = get_from_vault()  # soc2:ignore rotated via Vault, not a literal
+```
+```javascript
+// soc2:ignore-next-line vendor SDK requires the raw header
+logger.debug(req.headers.authorization);
+```
+
+`nosecret`, `nosecret-log`, `nosecret-sql`, and `pragma: allowlist secret` are also
+accepted so repos already using gitleaks or detect-secrets conventions keep working.
+
+A suppression is a review decision, not a control exception. If a **must** requirement
+genuinely cannot be met, record it in `.soc2/EXCEPTIONS.md` with rationale, compensating
+control, approver, and expiry — a bare `soc2:ignore` on a real gap is exactly the
+"compliance theater" this skill exists to prevent.
 
 ## Reference index
 

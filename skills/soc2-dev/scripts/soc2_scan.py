@@ -9,9 +9,12 @@ human or Claude review, not proof that a control exists.
 Usage:
     python3 soc2_scan.py <repo-root> [--format md|json] [--config .soc2/config.yml]
                          [--fail-on critical|high|medium|none]
+    python3 soc2_scan.py . --staged --fail-on high    # pre-commit gate
 
 Exit code 1 when any finding meets or exceeds --fail-on (default: critical).
 No third-party dependencies.
+
+Suppress a single line with a trailing `soc2:ignore` comment (see SUPPRESS below).
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import fnmatch
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from typing import Iterable
@@ -41,6 +45,45 @@ CONFIG_EXT = {
     ".properties", ".xml", ".conf", ".sh", ".sql",
 }
 MAX_FILE_BYTES = 1_000_000
+
+# Per-line suppression. `soc2:ignore` is the canonical marker; the rest are accepted
+# so repos already using gitleaks/detect-secrets conventions do not need a rewrite.
+# `soc2:ignore-next-line` suppresses the following line instead, for languages where a
+# trailing comment is awkward. A suppressed line must still be justified in review — it
+# is not an exception record (those live in .soc2/EXCEPTIONS.md).
+SUPPRESS = re.compile(
+    r"(?i)(?:#|//|/\*|--|<!--)\s*(?:soc2:ignore|nosecret(?:-log|-sql)?|pragma:\s*allowlist\s+secret)"
+)
+SUPPRESS_NEXT = re.compile(r"(?i)(?:#|//|/\*|--|<!--)\s*soc2:ignore-next-line")
+
+
+def suppressed_lines(text: str) -> set[int]:
+    out: set[int] = set()
+    for i, line in enumerate(text.splitlines(), 1):
+        if SUPPRESS_NEXT.search(line):
+            out.add(i + 1)
+        elif SUPPRESS.search(line):
+            out.add(i)
+    return out
+
+# Files allowed to enable debug: local/dev-only configuration.
+DEBUG_ALLOWED_NAMES = {
+    ".env.local", ".env.development", ".env.dev", ".env.test", ".env.example",
+    "settings_local.py", "settings_dev.py", "conftest.py", "docker-compose.override.yml",
+}
+
+
+def git_staged_files(root: str) -> list[str]:
+    """Paths staged for commit (added/copied/modified), absolute. Empty if not a repo."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", root, "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [os.path.join(root, p) for p in out.splitlines() if p.strip()]
+
 
 # --------------------------------------------------------------------------- config
 
@@ -137,12 +180,16 @@ class Finding:
 
 
 class Scanner:
-    def __init__(self, root: str, config: dict):
+    def __init__(self, root: str, config: dict, staged: list[str] | None = None):
         self.root = os.path.abspath(root)
         self.cfg = config
+        self.staged = staged
         self.findings: list[Finding] = []
-        self.files: list[str] = []
+        self.files: list[str] = []   # files to scan (the staged set, or the whole repo)
+        self.corpus: list[str] = []  # whole repo, for presence/heuristic checks
         self.text_cache: dict[str, str] = {}
+        self.cur_file = ""          # relpath being scanned, for suppression lookup
+        self.cur_suppressed: set[int] = set()
         self.ignore_globs = [str(g) for g in (config.get("scan_ignore") or [])]
         self.public_routes = {self._norm_route(r) for r in (config.get("public_routes") or [])}
         tsc = config.get("tsc") or {}
@@ -168,6 +215,8 @@ class Scanner:
 
     def add(self, **kw):
         f = Finding(**kw)
+        if f.file == self.cur_file and f.line in self.cur_suppressed:
+            return
         if f.key() not in {x.key() for x in self.findings}:
             self.findings.append(f)
 
@@ -196,6 +245,16 @@ class Scanner:
         self.text_cache[path] = t
         return t
 
+    def _scannable(self, fn: str) -> bool:
+        ext = os.path.splitext(fn)[1].lower()
+        return (
+            ext in CODE_EXT
+            or ext in CONFIG_EXT
+            or fn in ("Dockerfile", ".env", ".gitignore", "CODEOWNERS", "Gemfile", "Procfile")
+            or fn.startswith("Dockerfile")
+            or fn.startswith(".env")
+        )
+
     def walk(self):
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if d not in ALWAYS_IGNORE_DIRS]
@@ -204,11 +263,21 @@ class Scanner:
                 rp = self.rel(full)
                 if self.ignored(rp):
                     continue
-                ext = os.path.splitext(fn)[1].lower()
-                if ext in CODE_EXT or ext in CONFIG_EXT or fn in (
-                    "Dockerfile", ".env", ".gitignore", "CODEOWNERS", "Gemfile", "Procfile"
-                ) or fn.startswith("Dockerfile") or fn.startswith(".env"):
-                    self.files.append(full)
+                if self._scannable(fn):
+                    self.corpus.append(full)
+        if self.staged is None:
+            self.files = list(self.corpus)
+            return
+        # Staged mode scans only the change set, but presence heuristics (stack
+        # detection, global auth middleware, library availability) must still see the
+        # whole repo or every staged route looks unauthenticated.
+        for full in self.staged:
+            if not os.path.isfile(full):
+                continue  # staged deletion, or a path outside the worktree
+            rp = self.rel(full)
+            if self.ignored(rp) or not self._scannable(os.path.basename(full)):
+                continue
+            self.files.append(full)
 
     def exists(self, *cands: str) -> str | None:
         for c in cands:
@@ -226,7 +295,7 @@ class Scanner:
         return None
 
     def any_file_matches(self, pattern: re.Pattern, exts: Iterable[str] | None = None) -> bool:
-        for p in self.files:
+        for p in self.corpus:
             if exts and os.path.splitext(p)[1].lower() not in exts:
                 continue
             if pattern.search(self.read(p)):
@@ -244,6 +313,8 @@ class Scanner:
                 continue
             ext = os.path.splitext(p)[1].lower()
             base = os.path.basename(p)
+            self.cur_file = rp
+            self.cur_suppressed = suppressed_lines(text)
             self.check_secrets(rp, text)
             if ext in CODE_EXT:
                 self.check_weak_crypto(rp, text)
@@ -257,9 +328,15 @@ class Scanner:
             if ext in (".tf", ".hcl", ".json", ".yml", ".yaml"):
                 self.check_infra(rp, text)
                 self.check_tls_disabled(rp, text)
+            # Debug flags live in config and dotenv files as often as in code (SEC-06).
+            if ext in CONFIG_EXT or base.startswith(".env"):
+                self.check_debug(rp, text)
             if base.startswith("Dockerfile"):
                 self.check_dockerfile(rp, text)
-        self.check_repo_controls()
+        self.cur_file, self.cur_suppressed = "", set()
+        if self.staged is None:
+            # Repo-posture checks describe the whole repo, not the staged change set.
+            self.check_repo_controls()
         self.findings.sort(key=lambda f: (-SEVERITY_ORDER[f.severity], f.requirement, f.file, f.line))
         return self.findings
 
@@ -306,8 +383,10 @@ class Scanner:
         ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "critical"),
         ("Private key block", re.compile(r"-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"), "critical"),
         ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"), "critical"),
-        ("Slack token", re.compile(r"\bxox[abpr]-[0-9A-Za-z-]{10,}\b"), "critical"),
+        ("Slack token", re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}\b"), "critical"),
         ("Stripe live key", re.compile(r"\b(sk|rk)_live_[0-9a-zA-Z]{16,}\b"), "critical"),
+        ("Stripe test key", re.compile(r"\b(sk|rk)_test_[0-9a-zA-Z]{16,}\b"), "medium"),
+        ("AWS secret access key", re.compile(r"(?i)aws.{0,20}?['\"][0-9a-zA-Z/+]{40}['\"]"), "critical"),
         ("Google API key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"), "high"),
         ("JWT literal", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "high"),
         (
@@ -371,8 +450,8 @@ class Scanner:
 
     WEAK_CRYPTO = [
         (re.compile(r"(?i)createHash\(\s*['\"](md5|sha1)['\"]|hashlib\.(md5|sha1)\(|MessageDigest\.getInstance\(\s*\"(MD5|SHA-?1)\"|\"crypto/(md5|sha1)\"|Digest::(MD5|SHA1)|md5\(|sha1\("), "Weak hash (MD5/SHA-1)"),
-        (re.compile(r"(?i)\b(DES|3DES|TripleDES|RC4|Blowfish)\b.*(cipher|encrypt|Cipher|createCipher)|createCipher(iv)?\(\s*['\"](des|rc4|bf)"), "Weak cipher"),
-        (re.compile(r"(?i)/ECB/|mode\s*=\s*.*MODE_ECB|cipher\.NewCipher\(.*\)\s*$"), "ECB mode"),
+        (re.compile(r"(?i)\b(DES|3DES|TripleDES|RC4|Blowfish)\b.*(cipher|encrypt|Cipher|createCipher)|createCipher(iv)?\(\s*['\"](des|rc4|bf)"), "Weak cipher"),  # soc2:ignore pattern table, not a call site
+        (re.compile(r"(?i)/ECB/|mode\s*=\s*.*MODE_ECB|cipher\.NewCipher\(.*\)\s*$"), "ECB mode"),  # soc2:ignore pattern table, not a call site
         (re.compile(r"(?i)\bMath\.random\(\)|\brandom\.(random|randint|choice)\(|\bmath/rand\b|\bnew Random\(\)"), "Non-cryptographic RNG"),
         (re.compile(r"(?i)(password|passwd).{0,40}(md5|sha1|sha256|sha512)\(|(md5|sha1|sha256|sha512)\(.{0,40}(password|passwd)"), "Password hashed with a fast hash"),
     ]
@@ -398,6 +477,11 @@ class Scanner:
         (re.compile(r"(?i)\b(execute|executemany|raw|query|exec|prepare|cursor\.execute|db\.raw|knex\.raw|sequelize\.query|prisma\.\$queryRawUnsafe|\$executeRawUnsafe)\s*\(\s*(f[\"']|[\"'`][^\"'`]*(SELECT|INSERT|UPDATE|DELETE|WHERE|FROM)[^\"'`]*[\"'`]\s*\+|`[^`]*\$\{)"), "SQL built from string formatting or concatenation", "API-03", "high"),
         (re.compile(r"(?i)(fmt\.Sprintf|String\.format|\.format\(|%\s*\()\s*\(?\s*[\"'][^\"']*\b(SELECT|INSERT|UPDATE|DELETE)\b[^\"']*(%s|%d|%v|\{\})"), "SQL built with format string", "API-03", "high"),
         (re.compile(r"(?i)[\"']\s*(SELECT|INSERT|UPDATE|DELETE)\b[^\"']*(WHERE|VALUES|SET)[^\"']*[\"']\s*\+\s*[A-Za-z_]"), "SQL string concatenated with a variable", "API-03", "high"),
+        # The three below tolerate quote characters *inside* the SQL literal
+        # (`"... WHERE name = '" + name`), which the [^"']* patterns above cannot cross.
+        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?[\"']\s*\+\s*[A-Za-z_]"), "SQL string concatenated with a variable", "API-03", "high"),
+        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?[\"']\s*\.\s*format\s*\("), "SQL built with .format()", "API-03", "high"),
+        (re.compile(r"(?i)[\"'][^\"']{0,4}\b(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,240}?[\"']\s*%\s*[\(\[]?\s*[A-Za-z_]"), "SQL built with %-interpolation", "API-03", "high"),
         (re.compile(r"(?i)\b(os\.system|os\.popen|subprocess\.(call|run|Popen|check_output)\([^)]*shell\s*=\s*True|child_process\.exec\(|execSync\(|Runtime\.getRuntime\(\)\.exec\(|exec\.Command\(\s*\"(sh|bash|cmd)\")"), "Shell command execution; verify inputs are not user-controlled", "API-03", "medium"),
         (re.compile(r"(?<![A-Za-z_.])eval\s*\(|new Function\(|vm\.runIn"), "Dynamic code evaluation", "API-03", "high"),
         (re.compile(r"(?i)\$where\s*:|\{\s*\$where"), "MongoDB $where operator (JS injection)", "API-03", "high"),
@@ -413,12 +497,42 @@ class Scanner:
                         snippet=_snip(line), check="injection",
                     )
 
-    LOG_CALL = re.compile(r"(?i)\b(console\.(log|info|warn|error|debug)|logger?\.(info|warn|warning|error|debug|trace|log|Printf|Println|Print|Infof|Errorf|Warnf|Debugf)|logging\.(info|warning|error|debug)|log\.(Printf|Println|Print)|slog\.(Info|Warn|Error|Debug)|zap\.[SL]\(\)\.\w+|print\()\s*\(")
-    LOG_SENSITIVE = re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|bearer|ssn|social[_-]?security|credit[_-]?card|card[_-]?number|cvv|req\.body|request\.body|req\.headers|request\.headers|\.cookies|private[_-]?key|otp)\b")
+    # NOTE: `print(` is a separate alternative with its own paren. Folding it into the
+    # group above would require `print((` to match, which silently disabled the check.
+    LOG_CALL = re.compile(
+        r"(?i)(?:\b(?:console\.(?:log|info|warn|error|debug)"
+        r"|logger?\.(?:info|warn|warning|error|debug|trace|log|Printf|Println|Print|Infof|Errorf|Warnf|Debugf)"
+        r"|logging\.(?:info|warning|error|debug)"
+        r"|log\.(?:Printf|Println|Print)"
+        r"|slog\.(?:Info|Warn|Error|Debug)"
+        r"|fmt\.(?:Print|Printf|Println|Fprintf)"
+        r"|System\.out\.print(?:ln)?"
+        r"|zap\.[SL]\(\)\.\w+)\s*\("
+        r"|(?<![\w.])print\s*\()"
+    )
+    LOG_SENSITIVE = re.compile(
+        r"(?i)\b(password|passwd|pwd|secret|api[_-]?key|apikey|token|access[_-]?token|refresh[_-]?token"
+        r"|id[_-]?token|authorization|auth[_-]?header|bearer|ssn|social[_-]?security|credit[_-]?card"
+        r"|card[_-]?number|cvv|req\.body|request\.body|req\.headers|request\.headers|\.cookies"
+        r"|private[_-]?key|otp)\b"
+        # Identifier-suffixed forms: generate_token(), user_secret, refresh_password.
+        r"|[A-Za-z]+_(?:tokens?|secrets?|passwords?|credentials?)\b"
+    )
+    # A string literal with no interpolation is static text, not logged data.
+    STATIC_STR = re.compile(r"""(['"`])(?:\\.|(?!\1)[^\\])*\1""")
+    INTERPOLATED = re.compile(r"\$\{|\{[A-Za-z_][\w.\[\]'\"]*\}|%\(|%[sdrvf]\b|\{\}")
+
+    @classmethod
+    def _strip_static_strings(cls, line: str) -> str:
+        """Blank out literal strings that interpolate nothing, so a help message
+        mentioning 'secret-scan' is not mistaken for a logged credential."""
+        return cls.STATIC_STR.sub(
+            lambda m: m.group(0) if cls.INTERPOLATED.search(m.group(0)) else '""', line
+        )
 
     def check_logging_pii(self, rp: str, text: str):
         for i, line in enumerate(text.splitlines(), 1):
-            if self.LOG_CALL.search(line) and self.LOG_SENSITIVE.search(line):
+            if self.LOG_CALL.search(line) and self.LOG_SENSITIVE.search(self._strip_static_strings(line)):
                 if re.search(r"(?i)(redact|mask|sanitize|scrub|\*\*\*|\[REDACTED\])", line):
                     continue
                 self.add(
@@ -428,7 +542,7 @@ class Scanner:
                     snippet=_snip(line), check="log-pii",
                 )
 
-    TLS_OFF = re.compile(r"(?i)rejectUnauthorized\s*:\s*false|verify\s*=\s*False|InsecureSkipVerify\s*:\s*true|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['\"]?0|sslmode\s*=\s*disable|ssl\s*[:=]\s*false|verify_ssl\s*=\s*False|CURLOPT_SSL_VERIFYPEER,\s*false|TrustAllCerts|trustAllCertificates|ALLOW_ALL_HOSTNAME_VERIFIER|\bhttp://[a-z0-9.-]*(api|auth|db|internal|service)[a-z0-9.-]*[:/]")
+    TLS_OFF = re.compile(r"(?i)rejectUnauthorized\s*:\s*false|verify\s*=\s*False|InsecureSkipVerify\s*:\s*true|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['\"]?0|sslmode\s*=\s*disable|ssl\s*[:=]\s*false|verify_ssl\s*=\s*False|CURLOPT_SSL_VERIFYPEER,\s*false|TrustAllCerts|trustAllCertificates|ALLOW_ALL_HOSTNAME_VERIFIER|\bhttp://[a-z0-9.-]*(api|auth|db|internal|service)[a-z0-9.-]*[:/]")  # soc2:ignore pattern table, not a call site
 
     def check_tls_disabled(self, rp: str, text: str):
         for i, line in enumerate(text.splitlines(), 1):
@@ -454,10 +568,12 @@ class Scanner:
                     snippet=_snip(line), check="cors",
                 )
 
-    DEBUG_ON = re.compile(r"(?i)^\s*DEBUG\s*=\s*True\b|debug\s*=\s*True\s*\)|app\.run\([^)]*debug\s*=\s*True|\bdebug\s*:\s*true\b|\"debug\"\s*:\s*true|--inspect\b|NODE_ENV\s*=\s*['\"]development['\"]")
+    DEBUG_ON = re.compile(r"(?i)^\s*DEBUG\s*=\s*True\b|debug\s*=\s*True\s*\)|app\.run\([^)]*debug\s*=\s*True|\bdebug\s*:\s*true\b|\"debug\"\s*:\s*true|--inspect\b|NODE_ENV\s*=\s*['\"]?development['\"]?|^\s*[A-Z_]*DEBUG\s*=\s*(1|true|on)\s*$|^\s*(APP_|DJANGO_|RAILS_)?DEBUG\s*=\s*['\"]?(1|true|on)['\"]?\s*$")
 
     def check_debug(self, rp: str, text: str):
         if re.search(r"(^|/)(test|tests|spec|dev|local|scripts?)(/|$)|settings/(dev|local)", rp):
+            return
+        if os.path.basename(rp) in DEBUG_ALLOWED_NAMES:
             return
         for i, line in enumerate(text.splitlines(), 1):
             if self.DEBUG_ON.search(line) and not re.search(r"(?i)os\.environ|getenv|process\.env|if\s+.*\b(dev|development|debug)\b", line):
@@ -617,7 +733,7 @@ class Scanner:
                 ci_text += self.read(p)
         precommit = self.read(os.path.join(self.root, ".pre-commit-config.yaml")) + self.read(os.path.join(self.root, ".pre-commit-config.yml"))
         has_ci = bool(ci_text.strip())
-        code_present = any(os.path.splitext(f)[1].lower() in CODE_EXT for f in self.files)
+        code_present = any(os.path.splitext(f)[1].lower() in CODE_EXT for f in self.corpus)
 
         if not has_ci:
             self.add(requirement="CHG-02", severity="high", confidence="high", file=R, line=0,
@@ -672,7 +788,7 @@ class Scanner:
                 self.add(requirement="LOG-01", severity="medium", confidence="medium", file=R, line=0,
                          message="No audit log primitive detected (no identifier containing 'audit')",
                          fix="Add an append-only audit logger and emit events for auth, permission, admin, and restricted-data actions (see logging-and-audit.md).", check="audit-primitive")
-            routes_exist = any(self.ROUTE_PATTERNS[k].search(self.read(p)) for p in self.files for k in self.ROUTE_PATTERNS if os.path.splitext(p)[1].lower() in CODE_EXT)
+            routes_exist = any(self.ROUTE_PATTERNS[k].search(self.read(p)) for p in self.corpus for k in self.ROUTE_PATTERNS if os.path.splitext(p)[1].lower() in CODE_EXT)
             if routes_exist:
                 if not self.any_file_matches(re.compile(r"(?i)express-rate-limit|rate-limiter-flexible|rateLimit\(|slowapi|@limiter|ratelimit|Bucket4j|golang\.org/x/time/rate|tollbooth|httprate|throttle|Rack::Attack|ThrottlerModule"), CODE_EXT | {".json", ".toml", ".txt", ".mod", ".xml", ".gradle", ".kts"}):
                     self.add(requirement="API-04", severity="medium", confidence="medium", file=R, line=0,
@@ -743,15 +859,29 @@ def main(argv=None):
     ap.add_argument("--config", default=None, help="path to .soc2/config.yml (default: <root>/.soc2/config.yml)")
     ap.add_argument("--fail-on", choices=["critical", "high", "medium", "low", "none"], default="critical")
     ap.add_argument("--min-severity", choices=["critical", "high", "medium", "low", "info"], default="info", help="hide findings below this severity")
+    ap.add_argument("--staged", action="store_true",
+                    help="scan only files staged in git and skip repo-posture checks (pre-commit mode)")
     args = ap.parse_args(argv)
 
     cfg_path = args.config or os.path.join(args.root, ".soc2", "config.yml")
     cfg = load_config(cfg_path)
-    sc = Scanner(args.root, cfg)
+
+    staged = None
+    if args.staged:
+        staged = git_staged_files(args.root)
+        if not staged:
+            if args.format == "json":
+                print(json.dumps({"root": os.path.abspath(args.root), "staged": True, "findings": []}, indent=2))
+            else:
+                print("No staged files to scan.")
+            return 0
+
+    sc = Scanner(args.root, cfg, staged=staged)
     findings = [f for f in sc.run() if SEVERITY_ORDER[f.severity] >= SEVERITY_ORDER[args.min_severity]]
 
     if args.format == "json":
-        print(json.dumps({"root": os.path.abspath(args.root), "stack": sorted(sc.stack), "global_auth_detected": sc.global_auth,
+        print(json.dumps({"root": os.path.abspath(args.root), "staged": bool(args.staged),
+                          "stack": sorted(sc.stack), "global_auth_detected": sc.global_auth,
                           "counts": {k: sum(1 for f in findings if f.severity == k) for k in SEVERITY_ORDER},
                           "findings": [asdict(f) for f in findings]}, indent=2))
     else:

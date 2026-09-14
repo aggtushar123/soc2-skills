@@ -1,7 +1,21 @@
-# Secret scanning before code leaves the developer machine (SEC-01).
+# Pre-commit gates (SEC-01, API-03, LOG-03, SEC-06).
 # Install: pipx install pre-commit && pre-commit install
+#
+# Two layers, deliberately:
+#   - gitleaks    entropy + rule-based secret detection, catches what regexes miss
+#   - soc2-scan   the skill's own heuristics on staged files only; no dependencies,
+#                 so it still runs where gitleaks is not installed
 repos:
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.21.2
     hooks:
       - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: soc2-scan
+        name: soc2 scan (staged)
+        entry: python3 .claude/skills/soc2-dev/scripts/soc2_scan.py . --staged --fail-on high
+        language: system
+        pass_filenames: false
+        always_run: true

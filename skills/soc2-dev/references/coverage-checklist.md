@@ -13,7 +13,7 @@ never objects to more.
 |---|-------------------|-----|-----------------|---------------|
 | 1 | No hardcoded secrets, credentials, or API keys in source | CC6.1 | SEC-01 | yes: secret patterns, `.env`, Dockerfile ENV |
 | 2 | Secrets pulled from vault or env, not committed to VCS | CC6.1 | SEC-01, SEC-02 | yes: `.env` git-ignored, secret scan in CI |
-| 3 | Input validation and injection prevention (SQLi, XSS, command injection) | CC6.6, CC6.8 | API-01, API-02, API-03 | yes: string-built SQL, shell exec, eval, validation lib presence |
+| 3 | Input validation and injection prevention (SQLi, XSS, command injection) | CC6.6, CC6.8 | API-01, API-02, API-03 | yes: string-built SQL (concatenation, `.format()`, `%`, f-strings, template literals), shell exec, eval, validation lib presence |
 | 4 | Authentication implementation (password hashing, MFA hooks, session tokens) | CC6.1, CC6.2 | AUTH-03, AUTH-04, AUTH-05 | yes: hashing lib presence, MFA presence, fast-hash on password |
 | 5 | Password complexity and rotation rules enforced in code (if auth is in-app) | CC6.1 | AUTH-04 (config: `password_min_length`, `password_max_age_days`, `external_idp`) | partial: weak hashing only |
 | 6 | Session timeout and idle logout enforced in code | CC6.1 | AUTH-05 (config: `idle_timeout_minutes`, `access_token_ttl_minutes`) | no: manual review |
@@ -30,8 +30,8 @@ never objects to more.
 | 17 | Rate limiting and brute-force protection on auth endpoints | CC6.1 | API-04, AUTH-06 | yes: rate-limit lib presence |
 | 18 | Secure deletion and data-wipe functions for decommissioned data | CC6.5 | DATA-05, DATA-04 | no: manual review |
 | 19 | Security event and audit logging (auth events, access changes, admin actions) | CC7.2 | LOG-01, LOG-02 | yes: audit primitive presence |
-| 20 | Logs contain no secrets or PII in plaintext | CC6.1, CC7.2 | LOG-03 | yes: log call referencing secrets, tokens, raw request |
-| 21 | Error handling leaks no stack traces or internal info | CC6.1 | API-05, SEC-06 | yes: unconditional debug mode |
+| 20 | Logs contain no secrets or PII in plaintext | CC6.1, CC7.2 | LOG-03 | yes: log call referencing secrets, tokens, raw request — including bare `print`/`fmt.Print`/`System.out.println`; static help text is not flagged |
+| 21 | Error handling leaks no stack traces or internal info | CC6.1 | API-05, SEC-06 | yes: unconditional debug mode in code, config files (YAML/TOML/INI/JSON) and `.env` |
 | 22 | Dependency and SCA vulnerability scanning | CC7.1 | SEC-03 | yes: SCA in CI or Dependabot/Renovate, lockfile |
 | 23 | SAST integrated in pipeline | CC7.1 | SEC-04 | yes: SAST tool in CI |
 | 24 | CWE Top 25 weaknesses avoided | CC6.6, CC7.1 | see `cwe-top25-map.md` | partial: injection, crypto, secrets, eval |
