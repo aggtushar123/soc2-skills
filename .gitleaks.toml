@@ -1,0 +1,13 @@
+# gitleaks configuration for this repository.
+# The test suite plants deliberately fake credentials so the scanner's own detection
+# rules can be regression-tested. They are not real and must not block CI.
+title = "soc2-skills"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Planted fixture values used to test soc2_scan.py"
+paths = [
+  '''^tests/.*''',
+]
