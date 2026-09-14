@@ -1,0 +1,7 @@
+# Secret scanning before code leaves the developer machine (SEC-01).
+# Install: pipx install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

@@ -1,0 +1,30 @@
+# CODEOWNERS — required reviewers for security-sensitive paths (CHG-04)
+# Adjust paths to this repo's layout and replace the team handles.
+
+# Authentication, authorization, sessions, crypto
+**/auth/**            @security-team
+**/middleware/auth*   @security-team
+**/crypto/**          @security-team
+**/security/**        @security-team
+
+# Data models and migrations
+**/migrations/**      @security-team @platform-team
+**/models/**          @platform-team
+**/schema/**          @platform-team
+
+# CI, build, release
+.github/**            @security-team @platform-team
+.gitlab-ci.yml        @security-team @platform-team
+Dockerfile*           @platform-team
+docker-compose*.yml   @platform-team
+
+# Infrastructure
+infra/**              @platform-team @security-team
+terraform/**          @platform-team @security-team
+**/*.tf               @platform-team @security-team
+k8s/**                @platform-team
+
+# Compliance records
+.soc2/**              @security-team
+docs/policies/**      @security-team
+SECURITY.md           @security-team

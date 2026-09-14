@@ -1,0 +1,75 @@
+# SOC 2 configuration for this repository. Read by the soc2-dev skill and its scripts.
+# Values here override the defaults in the skill's requirement registry.
+
+company: "[COMPANY NAME]"
+system_name: "[SYSTEM NAME]"           # the in-scope system/service as named in the SOC 2 report
+owner: "[security-owner@example.com]"  # default control owner for CONTROL_MAP rows
+
+# Trust Service Criteria in scope. Security is always in scope.
+tsc:
+  security: true
+  availability: false
+  confidentiality: true
+  processing_integrity: false
+  privacy: false
+
+# Data classes this system handles. Drives DATA-* and LOG-03 checks.
+data:
+  pii: true
+  phi: false
+  payment_card: false
+  multi_tenant: true
+  classification_default: internal     # public | internal | confidential | restricted
+
+# Engineering parameters referenced by requirements.
+auth:
+  mfa_required_for: [admin, privileged]  # add "all" to require MFA for everyone
+  external_idp: false                    # true if login is delegated to Okta/Auth0/Entra etc.; AUTH-04 then applies at the IdP
+  password_min_length: 12
+  password_max_age_days: 0               # 0 = no forced rotation (NIST 800-63B); set >0 only if a policy requires it
+  password_breach_check: true
+  access_token_ttl_minutes: 60
+  refresh_token_ttl_days: 30
+  idle_timeout_minutes: 30
+  lockout_after_failures: 10
+
+retention_days:
+  audit_logs: 365
+  application_logs: 90
+  user_pii_after_account_close: 30
+  backups: 35
+  support_tickets: 730
+
+patch_sla_days:
+  critical: 7
+  high: 30
+  medium: 90
+  low: 180
+
+# Where this repo keeps its organizational policies. Overrides the bundled templates.
+policies_dir: docs/policies
+
+# Stack hints. Leave empty for auto-detection.
+stack:
+  language: ""        # node | python | go | java | ruby | dotnet
+  framework: ""       # express | fastapi | django | chi | gin | spring
+  ci: ""              # github | gitlab | circleci | other
+  cloud: ""           # aws | gcp | azure | other
+
+# Paths the scanner should ignore, in addition to .gitignore'd paths.
+scan_ignore:
+  - node_modules
+  - vendor
+  - dist
+  - build
+  - "**/*.test.*"
+  - "**/*_test.go"
+  - "**/tests/**"
+
+# Routes that are intentionally public. The scanner will not flag these for AUTH-01.
+public_routes:
+  - "GET /health"
+  - "GET /ready"
+  - "POST /auth/login"
+  - "POST /auth/signup"
+  - "POST /auth/forgot-password"
